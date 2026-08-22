@@ -23,7 +23,7 @@
 
   const SCRIPT_VERSION = GM_info?.script?.version || '0';
   const SHEET_ID = '1JM-0SlxVDAi-C6rGVlLxa-J1WGewEeL8Qvq4htWZHhY';
-  const CACHE_TTL = 24 * 60 * 60 * 1000;
+  const CACHE_TTL = 7 * 24 * 60 * 60 * 1000;
   const AEGIS_ATTR = 'data-dim-aegis';
 
   const ALL_TABS = [
