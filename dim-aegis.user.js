@@ -2,7 +2,7 @@
 // @name         DIM Aegis Overlay
 // @namespace    Revadike
 // @author       Revadike
-// @version      1.4.1
+// @version      1.4.2
 // @description  Overlays Aegis weapon tier list data on DIM item popups
 // @match        https://app.destinyitemmanager.com/*
 // @match        https://beta.destinyitemmanager.com/*
@@ -24,6 +24,7 @@
   const SCRIPT_VERSION = GM_info?.script?.version || '0';
   const SHEET_ID = '1JM-0SlxVDAi-C6rGVlLxa-J1WGewEeL8Qvq4htWZHhY';
   const CACHE_TTL = 7 * 24 * 60 * 60 * 1000;
+  const MAX_FETCH_RETRIES = 2;
   const AEGIS_ATTR = 'data-dim-aegis';
 
   const ALL_TABS = [
@@ -36,6 +37,10 @@
   const ARCHETYPES_TAB = 'Archetypes';
 
   const ENERGY_TYPES = ['Kinetic', 'Stasis', 'Solar', 'Arc', 'Void', 'Strand'];
+
+  const logError = (context, error) => {
+    console.error(`[DIM Aegis] ${context}`, error);
+  };
 
   // Invalidate cached sheet data when script version changes
   if (GM_getValue('aegis_version', null) !== SCRIPT_VERSION) {
@@ -199,19 +204,40 @@
     return rows;
   };
 
-  const fetchSheet = (tab) => new Promise((resolve, reject) => {
+  const fetchSheet = (tab, attempt = 0) => new Promise((resolve, reject) => {
+    const retry = (error) => {
+      if (attempt < MAX_FETCH_RETRIES) {
+        setTimeout(() => fetchSheet(tab, attempt + 1).then(resolve, reject), 500 * (attempt + 1));
+        return;
+      }
+      reject(error);
+    };
+
     GM_xmlhttpRequest({
       method: 'GET',
       url: `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(tab)}`,
       timeout: 15000,
-      onload: (r) => r.status === 200 ? resolve(parseCSV(r.responseText)) : reject(new Error(`HTTP ${r.status}`)),
-      onerror: () => reject(new Error('Network error')),
-      ontimeout: () => reject(new Error('Timeout')),
+      onload: (r) => {
+        if (r.status !== 200) {
+          const error = new Error(`HTTP ${r.status}`);
+          if (r.status === 429 || r.status >= 500) retry(error);
+          else reject(error);
+          return;
+        }
+        try {
+          resolve(parseCSV(r.responseText));
+        } catch (error) {
+          reject(error);
+        }
+      },
+      onerror: () => retry(new Error('Network error')),
+      ontimeout: () => retry(new Error('Timeout')),
     });
   });
 
   /** In-memory cache to avoid re-parsing GM storage on every lookup. */
   const memCache = new Map();
+  const pendingSheets = new Map();
 
   const buildIdx = (rows) =>
     Object.fromEntries((rows[0] ?? []).map((col, i) => [col, i]));
@@ -239,6 +265,7 @@
   const WEAPON_TYPE_ALIASES = {
     'combat bow': 'bow',
     'submachine gun': 'smg',
+    'rocket sidearm': 'sidearm',
   };
 
   /**
@@ -371,20 +398,35 @@
   };
 
   const getSheet = async (tab) => {
-    if (memCache.has(tab)) return memCache.get(tab);
-    const dk = `aegis_data_${tab}`, tk = `aegis_ts_${tab}`;
-    const stored = GM_getValue(dk, null);
-    if (stored && Date.now() - GM_getValue(tk, 0) < CACHE_TTL) {
-      const rows = JSON.parse(stored);
-      memCache.set(tab, rows);
-      return rows;
-    }
-    const rawRows = await fetchSheet(tab);
-    const rows = preprocessRows(rawRows);
-    GM_setValue(dk, JSON.stringify(rows));
-    GM_setValue(tk, Date.now());
-    memCache.set(tab, rows);
-    return rows;
+    if (pendingSheets.has(tab)) return pendingSheets.get(tab);
+
+    const load = (async () => {
+      try {
+        if (memCache.has(tab)) return memCache.get(tab);
+        const dk = `aegis_data_${tab}`, tk = `aegis_ts_${tab}`;
+        const stored = GM_getValue(dk, null);
+        if (stored && Date.now() - GM_getValue(tk, 0) < CACHE_TTL) {
+          const rows = JSON.parse(stored);
+          memCache.set(tab, rows);
+          return rows;
+        }
+        const rawRows = await fetchSheet(tab);
+        const rows = preprocessRows(rawRows);
+        GM_setValue(dk, JSON.stringify(rows));
+        GM_setValue(tk, Date.now());
+        memCache.set(tab, rows);
+        return rows;
+      } catch (error) {
+        logError(`Failed to load ${tab} sheet`, error);
+        throw error;
+      }
+    })();
+    pendingSheets.set(tab, load);
+    load.then(
+      () => pendingSheets.delete(tab),
+      () => pendingSheets.delete(tab),
+    );
+    return load;
   };
 
   /**
@@ -525,19 +567,77 @@
   };
 
   /**
+   * Build the set of normalized weapon-type keys present in the Archetypes
+   * sheet's "Weapon" column. Used to recognize the item's type label in the
+   * popup DOM without relying on DIM's now-hashed class names.
+   * @param {string[][]} rows
+   * @param {Record<string,number>} idx
+   * @returns {Set<string>}
+   */
+  const buildWeaponTypeKeys = (rows, idx) => {
+    const wi = idx['Weapon'];
+    if (wi === undefined) return new Set();
+    return new Set(
+      rows.slice(1)
+        .map((r) => normWeaponType(r[wi]))
+        .filter(Boolean)
+    );
+  };
+
+  /**
+   * Find the item's weapon-type label (e.g. "Auto Rifle") among the popup's
+   * leaf elements by matching its normalized text against the sheet's types.
+   * @param {Element} popup
+   * @param {Set<string>} weaponTypeKeys
+   * @returns {string|null}
+   */
+  const findWeaponTypeLabel = (popup, weaponTypeKeys) => {
+    for (const el of popup.querySelectorAll('div, span')) {
+      if (el.children.length) continue;
+      const text = el.textContent?.trim();
+      if (text && weaponTypeKeys.has(normWeaponType(text))) return text;
+    }
+    return null;
+  };
+
+  /**
    * Extract the weapon type label and archetype/frame name+element used to
    * look up the Archetypes sheet (Weapon + Frame columns).
+   *
+   * DIM now hashes its CSS module class names, so the previous `itemType` /
+   * `ArchetypeSocket-m_name` selectors no longer match. Instead we:
+   * - locate the frame row via the "Display perks" button's previous sibling
+   *   (the same navigation extractWeaponInfo already uses successfully);
+   * - take the first leaf div as the archetype name ("Adaptive Frame") and the
+   *   second as the "600 rpm / 21 impact" style stats line;
+   * - find the weapon type by matching leaf text against the sheet's values.
    * @param {Element} popup
-   * @returns {{ weaponType: string, frameName: string, nameEl: Element }|null}
+   * @param {Set<string>} weaponTypeKeys - normalized weapon types from the sheet
+   * @returns {{ weaponType: string, frameName: string, nameEl: Element, statsEl: Element|null }|null}
    */
-  const extractArchetypeInfo = (popup) => {
-    const typeEl = popup.querySelector('div[class*="itemType"]');
-    const nameEl = popup.querySelector('div[class*="ArchetypeSocket-m_name"]');
-    if (!typeEl || !nameEl) return null;
-    const weaponType = typeEl.textContent?.trim() ?? '';
+  const extractArchetypeInfo = (popup, weaponTypeKeys) => {
+    const perksBtn = popup.querySelector('button[title^="Display perks"]');
+    const frameRow = perksBtn?.parentElement?.previousElementSibling;
+    if (!frameRow) return null;
+
+    const textDiv = [...frameRow.children].find(
+      (c) => !c.querySelector('.item-img') && !c.querySelector('img')
+    );
+    if (!textDiv) return null;
+
+    const leaves = [...textDiv.querySelectorAll('div')].filter(
+      (d) => !d.children.length && d.textContent.trim()
+    );
+    const nameEl = leaves[0];
+    if (!nameEl) return null;
+
     const frameName = nameEl.textContent?.trim() ?? '';
-    if (!weaponType || !frameName) return null;
-    return { weaponType, frameName, nameEl };
+    if (!frameName) return null;
+
+    const weaponType = findWeaponTypeLabel(popup, weaponTypeKeys);
+    if (!weaponType) return null;
+
+    return { weaponType, frameName, nameEl, statsEl: leaves[1] ?? null };
   };
 
   /**
@@ -705,7 +805,7 @@
   /**
    * Inject the archetype tier chip next to the archetype/frame name, and replace
    * the rpm/impact stats line with the Aegis analysis notes for that archetype.
-   * @param {{ nameEl: Element }} archInfo
+   * @param {{ nameEl: Element, statsEl: Element|null }} archInfo
    * @param {string[]} row - Matched Archetypes sheet row
    * @param {Record<string,number>} idx - Archetypes sheet column index
    */
@@ -729,9 +829,8 @@
     const infoContainer = nameEl.parentElement;
     if (!infoContainer) return;
 
-    // Remove the existing "450 rpm / 27 impact" style stats line, if present
-    const statsEl = infoContainer.querySelector('div[class*="ItemSocketsWeapons-m_stats"]');
-    statsEl?.remove();
+    // Remove the existing "600 rpm / 21 impact" style stats line, if present
+    archInfo.statsEl?.remove();
 
     if (notes) {
       const noteEl = aegisEl('div', 'aegis-archetype-note');
@@ -781,11 +880,10 @@
     if (!isOverviewActive(popup)) return;
 
     const info = extractWeaponInfo(popup);
-    const archInfo = extractArchetypeInfo(popup);
 
     const [found, archRows] = await Promise.all([
       info?.name ? findWeapon(info.name, stale) : Promise.resolve(null),
-      archInfo ? getSheet(ARCHETYPES_TAB).catch(() => null) : Promise.resolve(null),
+      getSheet(ARCHETYPES_TAB).catch(() => null),
     ]);
 
     if (stale() || !document.contains(popup)) return;
@@ -800,10 +898,13 @@
       injectPerksAndSuperiors(popup, weapon, sup, found.tab, info.energy, info.frame);
     }
 
-    if (archInfo && archRows) {
+    if (archRows) {
       const archIdx = buildIdx(archRows);
-      const archRow = findArchetypeRow(archRows, archIdx, archInfo.weaponType, archInfo.frameName);
-      if (archRow) injectArchetypeOverlay(archInfo, archRow, archIdx);
+      const archInfo = extractArchetypeInfo(popup, buildWeaponTypeKeys(archRows, archIdx));
+      if (archInfo) {
+        const archRow = findArchetypeRow(archRows, archIdx, archInfo.weaponType, archInfo.frameName);
+        if (archRow) injectArchetypeOverlay(archInfo, archRow, archIdx);
+      }
     }
 
     adjustPopupPosition(popup);
